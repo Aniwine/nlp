@@ -50,6 +50,7 @@ except ImportError:
         "Xformers is not installed correctly. If you want to use memory_efficient_attention to accelerate training use the following command to install Xformers\npip install xformers."
     )
 
+#注意力掩码用于生成有状态的注意力权重张量，后续用于乘以值矩阵
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -59,22 +60,40 @@ def _make_causal_mask(
     Make causal mask used for bi-directional self-attention.
     """
     bsz, tgt_len = input_ids_shape
+    #创建tgt_len*tgt_len的矩阵，使用该dtype数据类型的最小值初始化,tgt_len即num_queries，自注意力查询和键值长度一致
     mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min, device=device), device=device)
+    #0-(tgt_len-1)的向量
     mask_cond = torch.arange(mask.size(-1), device=device)
+    #广播机制：
+    # [[0,1,2,3], 
+    #  [0,1,2,3],
+    #  [0,1,2,3],
+    #  [0,1,2,3]]
+    # <
+    # [[1,1,1,1],
+    #  [2,2,2,2],
+    #  [3,3,3,3],
+    #  [4,4,4,4]]
+    # 将下三角矩阵位置全部设置为0
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
+        #tgt_len*(past_key_values_length+tgt_len),前半段为0，后半段是上三角（除对角线）为1
         mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+        #也可以不使用None先扩展，expand的参数就表示每个维度的shape，不够的采用重复赋值
+        #bsz*tgt_len*tgt_len+past_key_values_length即bsz*num_queries*num_key_values,多扩展了一个维度暂时不清楚作用
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
+    # 将已有的二维（或三维）注意力mask扩展为4维
     if len(mask.size()) == 3:
         bsz, src_len, _ = mask.size()
         tgt_len = tgt_len if tgt_len is not None else src_len
+        #bsz*tgt_len*src_len即bsz*num_queries*num_key_values,多扩展了一个维度暂时不清楚作用
         expanded_mask = mask[:,None,:,:].expand(bsz, 1, tgt_len, src_len).to(dtype)
     else:
         bsz, src_len = mask.size()
@@ -82,7 +101,8 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
         expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
 
     inverted_mask = 1.0 - expanded_mask
-
+    
+    #将不需要注意的地方置为极小值，计算softmax时趋于零
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
@@ -92,11 +112,14 @@ class RMSNorm(nn.Module):
         RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
+        #对做归一化的embedding张量的每个元素都有一个g和b参数，但各个embedding张量共享参数
+        #即[g1,g2]*[1,2]
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        #torch.rsqrt是求根再倒数
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 
         # convert into half-precision if necessary
