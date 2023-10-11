@@ -132,10 +132,17 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
+        #θi=10000**(-2i/d)(i从0到d/2-1),等价于10000**(-i/d)(i从0到d-1，间隔为2)，所以inv_freq是d/2维向量
         self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
         self.max_seq_len_cached = max_position_embeddings
+        #max_seq_len_cached表示输入序列长，t则是序列对应的每个绝对位置，构成一个n维向量
         t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=torch.float32)
+        #外积https://zhuanlan.zhihu.com/p/514053520
+        #t:(0,1,...,m,..,n-1)
+        #inv_freq:(θ0,θ1,...,θ{d/2-1})
+        #得到n*(d/2)矩阵，每一行表示位置m乘上对应的θ
         freqs = torch.outer(t, self.inv_freq)
+        #TODO 这个地方拼接后第m行就成了(mθ0,mθ1,...,mθ{d/2-1},mθ0,mθ1,...,mθ{d/2-1}),并不是两个相同的θ是挨着的
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cached = emb.cos()[None, None, :, :].to(torch.float32)
         self.sin_cached = emb.sin()[None, None, :, :].to(torch.float32)
@@ -160,14 +167,18 @@ class RotaryEmbedding(torch.nn.Module):
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
+    #对输入序列q，比如第m行的d维向量qm，将它做成(-q{d/2-1},...,-q{d-1},q0,...,q{d/2})
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
-
+#TODO 这里的实现怎么感觉跟之前介绍的不一样呢，不一样的地方在于qm向量的sin序列并不是(-q1,q0,-q3,q2,...)这种交叉
+#而是(-q2,-q3,q0,q1)这种形式，θ序列并不是(θ0,θ0,θ1,θ1)形式而是(θ0,θ1,θ0,θ1)的形式
+#关于第一点链接处的评论有讨论https://zhuanlan.zhihu.com/p/645263524
 def apply_rotary_pos_emb(q, k, cos_, sin_, position_ids):
     cos = cos_.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin_.squeeze(1).squeeze(0)  # [seq_len, dim]
+    #position_ids是一个(bs,)的向量，每一个值指示一个batch中一条序列的位置
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     q_embed = (q.float() * cos) + (rotate_half(q.float()) * sin)
@@ -186,7 +197,7 @@ class MLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.act_fn = ACT2FN[hidden_act]
+        self.act_fn = ACT2FN[hidden_act]#ACT2FN是一个字典，取激活函数
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
