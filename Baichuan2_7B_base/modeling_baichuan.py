@@ -220,6 +220,7 @@ class Attention(nn.Module):
             )
         self.W_pack = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        #这个层需要输入序列，但是并没有插入位置信息，而是生成sin和cos序列的位置信息
         self.rotary_emb = RotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -234,10 +235,16 @@ class Attention(nn.Module):
             output_attentions: bool = False,
             use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        #hidden_states为隐状态，即输入序列，查询序列，键值序列
         bsz, q_len, _ = hidden_states.size()
-
+        #查询序列从hidden_size维向量变成3*hidden_size维向量
         proj = self.W_pack(hidden_states)
+        # [bsz, q_len, 3 * hidden_size] -> [3,bsz, q_len, hidden_size]
+        # 这个操作应该如何理解？作用是可以只用一个矩阵获取查询序列，键值序列，减小参数量
+        # 操作很惊艳，理解很困难，问题可以描述为如何理解transpose操作对numpy数组值的改变
+        # https://blog.csdn.net/qq_38290604/article/details/105390250
         proj = proj.unflatten(-1, (3, self.hidden_size)).unsqueeze(0).transpose(0, -2).squeeze(-2)
+        # 下面三个隐状态都是：bsz*num_heads*q_len*head_dim
         query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
