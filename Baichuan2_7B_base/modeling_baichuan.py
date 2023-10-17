@@ -341,6 +341,7 @@ class DecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
 
         if use_cache:
+            #present_key_value是自注意力的第三个输出，为其内部的past_key_value，即（key_states,value_states）
             outputs += (present_key_value,)
 
         return outputs
@@ -401,6 +402,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        # tgt_seq_len指的是seq_len,src_seq_len指的是past_key_values_length+seq_len
         combined_attention_mask = None
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
@@ -410,8 +412,10 @@ class BaichuanModel(BaichuanPreTrainedModel):
                 past_key_values_length=past_key_values_length,
             )
         #TODO 传入的attention_mask是什么？
+        #A:表示填充的掩码矩阵，shape同input_ids
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            # 说明past_key_values_length等于seq_len
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
                 inputs_embeds.device
             )
@@ -437,6 +441,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        #是否使用缓存机制，用于加速自回归预测，缓存时需要传递past_key_values参数。
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -453,7 +458,12 @@ class BaichuanModel(BaichuanPreTrainedModel):
 
         seq_length_with_past = seq_length
         past_key_values_length = 0
+        
 
+        """
+        上一个时间步的键值映射，如果需要做自回归预测，则需要将上一个时间步的键值传递给下一个时间步，
+        形状为(num_layers, 2, batch_size, num_heads, sequence_length, hidden_size // num_heads)
+        """
         if past_key_values is not None:
             #过去键值对的长度
             past_key_values_length = past_key_values[0][0].shape[2]
@@ -462,6 +472,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             #position_ids指的是输入序列在一个完整序列中的绝对位置，即第几个词元
+            #输入的位置编码，用于考虑序列中元素的顺序关系，形状同input_ids（应该是对bs内每一个序列都是一样的）
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
@@ -474,13 +485,16 @@ class BaichuanModel(BaichuanPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
         # embed positions
         if attention_mask is None:
+            #传入的attention_mask表示padding的掩码
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
             )
+        #attention_mask屏蔽了填充的和未来的词元
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
         )
 
+        #这里是输入bs*seq_len*embed_size
         hidden_states = inputs_embeds
 
         if self.gradient_checkpointing and self.training:
@@ -491,18 +505,24 @@ class BaichuanModel(BaichuanPreTrainedModel):
                 use_cache = False
 
         # decoder layers
+        #是否返回所有隐层状态，形状为(num_layers, batch_size, sequence_length, hidden_size)
         all_hidden_states = () if output_hidden_states else None
+        #是否返回注意力分数矩阵，形状为(batch_size, num_heads, sequence_length, sequence_length)
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
+                #输出隐状态包括了最开始的输入embedding
                 all_hidden_states += (hidden_states,)
 
+            #这里说明传入的past_key_value有num_layers个，每一个都是一个(key_states,value_states)的元组
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
-
+                
+                #使用这个函数相当于使用1.创建module，2.调用module(*input,output_attentions,None)
+                #这里写一个闭包是为了将decoder_layer作为参数传入，因为checkpoint函数只接受一个函数作为参数
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
@@ -510,6 +530,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
 
                     return custom_forward
 
+                #这里的checkpoint函数是为了减少显存占用，但是会增加运行时间,第一个参数是函数，后面的参数是函数的参数
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states,
@@ -544,6 +565,8 @@ class BaichuanModel(BaichuanPreTrainedModel):
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        
+        #封装为一个类，本质还是返回刚才那四个
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -569,6 +592,7 @@ class NormHead(nn.Module):
             norm_weight = self.weight
         else:
             norm_weight = self.weight
+        #注意nn.functional.linear接口与nn.Linear接口的区别
         return nn.functional.linear(hidden_states, norm_weight)
 
 _init_weights = True
@@ -788,11 +812,13 @@ class BaichuanForCausalLM(BaichuanPreTrainedModel):
             self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         if past_key_values:
+            #只要最后一个token
             input_ids = input_ids[:, -1:]
 
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
+            #计算最后一个维度的和
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
