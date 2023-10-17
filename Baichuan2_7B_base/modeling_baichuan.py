@@ -74,12 +74,12 @@ def _make_causal_mask(
     #  [2,2,2,2],
     #  [3,3,3,3],
     #  [4,4,4,4]]
-    # 将下三角矩阵位置全部设置为0
+    # 将下三角矩阵位置全部设置为0，上三角矩阵位置全部设置为负无穷
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
-        #tgt_len*(past_key_values_length+tgt_len),前半段为0，后半段是上三角（除对角线）为1
+        #tgt_len*(past_key_values_length+tgt_len),前半段为0，后半段是上三角（除对角线）为负无穷
         mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
         #也可以不使用None先扩展，expand的参数就表示每个维度的shape，不够的采用重复赋值
         #bsz*tgt_len*tgt_len+past_key_values_length即bsz*num_queries*num_key_values,多扩展了一个维度暂时不清楚作用
@@ -252,7 +252,9 @@ class Attention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+        #构建cos和sin向量，记住只用到了value_states的device属性
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        #给q，k都插入位置编码信息
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
 
@@ -263,6 +265,7 @@ class Attention(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
         if xops is not None and self.training:
+            #TODO 使用xops时，注意力机制有另外的实现方式
             attn_weights = None
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
@@ -272,9 +275,11 @@ class Attention(nn.Module):
             )
         else:
             with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                #传统的缩放点积注意力机制
                 attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask)
             attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        #综合所有头的输出
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -306,17 +311,20 @@ class DecoderLayer(nn.Module):
             use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
+        #残差连接存储输入
         residual = hidden_states
 
+        #注意力机制之后的LN移到了前面
         hidden_states = self.input_layernorm(hidden_states)
 
+        #只用了掩蔽注意力，没有用到普通的注意力，标准架构是掩蔽注意力-残差&LN-普通注意力-残差&LN-MLP-残差&LN
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            output_attentions=output_attentions,
+            output_attentions=output_attentions,#是否输出注意力权重
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
@@ -339,10 +347,15 @@ class DecoderLayer(nn.Module):
 
 
 class BaichuanPreTrainedModel(PreTrainedModel):
+    #配置类改写为baichuan自己实现的配置类
     config_class = BaichuanConfig
+    #加载模型时忽略的前缀
     base_model_prefix = "model"
+    # 表示该模型是否支持梯度检查点技术
     supports_gradient_checkpointing = True
+    #列表表示需要忽略哪些模块进行分割
     _no_split_modules = ["DecoderLayer"]
+    #列表表示在加载模型时应该忽略哪些键值
     _keys_to_ignore_on_load_unexpected = [r"decoder\.version"]
 
     def _init_weights(self, module):
@@ -364,10 +377,12 @@ class BaichuanPreTrainedModel(PreTrainedModel):
 class BaichuanModel(BaichuanPreTrainedModel):
     def __init__(self, config: BaichuanConfig):
         super().__init__(config)
+        #填充词元以及词表大小
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        #词嵌入层
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        #解码器层，共有配置文件中num_hidden_layers个
         self.layers = nn.ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -378,6 +393,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
     def get_input_embeddings(self):
         return self.embed_tokens
 
+    #TODO value指什么
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
@@ -393,7 +409,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
                 device=inputs_embeds.device,
                 past_key_values_length=past_key_values_length,
             )
-
+        #TODO 传入的attention_mask是什么？
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
@@ -439,14 +455,17 @@ class BaichuanModel(BaichuanPreTrainedModel):
         past_key_values_length = 0
 
         if past_key_values is not None:
+            #过去键值对的长度
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
+            #position_ids指的是输入序列在一个完整序列中的绝对位置，即第几个词元
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
+            #position_ids的shape为(1,seq_length),即注意是一个二维矩阵
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
